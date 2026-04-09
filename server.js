@@ -143,11 +143,44 @@ app.get('/return', async (req, res) => {
   try {
     const details     = await getExpressCheckoutDetails(token);
     const shippingAmt = details.PAYMENTREQUEST_0_SHIPPINGAMT || '5.00';
+    const zip         = details.SHIPTOZIP     || '';
+    const country     = details.SHIPTOCOUNTRY || 'US';
 
     console.log('\n─── GetExpressCheckoutDetails ───');
     console.log('Payer    :', details.EMAIL);
-    console.log('Zip      :', details.SHIPTOZIP);
+    console.log('Zip      :', zip);
+    console.log('Country  :', country);
     console.log('Shipping :', shippingAmt);
+
+    // SERVER-SIDE PINCODE ENFORCEMENT
+    // The callback warning is just UX — this is the real gate.
+    // Even if the buyer clicked Continue despite the warning, we block here.
+    const { isZipServiceable } = require('./shipping');
+    if (!isZipServiceable(zip, country)) {
+      console.log('\n🚫 BLOCKED: zip ' + zip + ' is not serviceable — payment rejected');
+      return res.status(400).send(`<!DOCTYPE html>
+<html lang=en>
+<head>
+  <meta charset=UTF-8><title>Delivery Not Available</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; }
+    .error { background: #fce8e6; border: 1px solid #ea4335; padding: 24px; border-radius: 8px; }
+    .error h1 { color: #c5221f; }
+    .btn { display:inline-block; margin-top:16px; padding:10px 24px;
+           background:#0070ba; color:white; border-radius:6px; text-decoration:none; }
+  </style>
+</head>
+<body>
+  <div class=error>
+    <h1>🚫 Delivery Not Available</h1>
+    <p>Sorry, we are unable to deliver to zip code <strong>${zip}</strong>.</p>
+    <p>Your payment has <strong>not</strong> been charged.</p>
+    <p>Please go back and use a supported delivery address.</p>
+    <a class=btn href=/>← Back to shop</a>
+  </div>
+</body>
+</html>`);
+    }
 
     const payment = await doExpressCheckoutPayment({ token, payerId: PayerID, shippingAmt });
 
