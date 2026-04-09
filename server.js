@@ -10,13 +10,23 @@ const { calculateShippingOptions, buildCallbackResponse } = require('./shipping'
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// Parse both JSON and URL-encoded bodies
-// PayPal sends the Instant Update callback as application/x-www-form-urlencoded
+// localtunnel bypass header
+app.use((req, res, next) => {
+  res.setHeader('bypass-tunnel-reminder', 'true');
+  next();
+});
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// Request logger
+app.use((req, res, next) => {
+  console.log(`\n[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
-// HOME PAGE – simple product & "Pay with PayPal" button
+// HOME PAGE
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
@@ -25,7 +35,7 @@ app.get('/', (req, res) => {
   <meta charset="UTF-8">
   <title>EC Instant Update Demo</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; }
+    body { font-family: Arial, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; }
     .product { border: 1px solid #ddd; padding: 24px; border-radius: 8px; }
     .price   { font-size: 1.4em; color: #333; font-weight: bold; }
     .note    { font-size: 0.85em; color: #888; margin-top: 8px; }
@@ -33,34 +43,38 @@ app.get('/', (req, res) => {
                background: #0070ba; color: white; border-radius: 6px;
                text-decoration: none; font-size: 1em; font-weight: bold; }
     .btn:hover { background: #005ea6; }
+    .zips { background:#f5f5f5; padding:12px; border-radius:6px; font-size:0.85em; margin-top:16px; }
+    .zips strong { display:block; margin-bottom:6px; }
+    .supported { color: #34a853; }
+    .unsupported { color: #ea4335; }
   </style>
 </head>
 <body>
-  <h1>🛒 EC Instant Update API Demo</h1>
+  <h1>🛒 EC Instant Update – Pincode Check Demo</h1>
   <div class="product">
-    <h2>Widget Pro (×2)</h2>
+    <h2>Widget Pro</h2>
     <div class="price">$20.00 + shipping</div>
     <p class="note">
-      Shipping options are calculated in real time from your PayPal address
-      via the <strong>Instant Update (Callback) API</strong>.
+      When you change your shipping address on PayPal, the server checks
+      if your <strong>pincode is serviceable</strong> and updates shipping options in real time.
     </p>
     <a class="btn" href="/checkout">Pay with PayPal</a>
+
+    <div class="zips">
+      <strong>Test with these sandbox addresses:</strong>
+      <span class="supported">✅ Supported zips:</span>
+      10001 (NY), 90001 (LA), 60601 (Chicago), 94102 (SF), 95101 (San Jose), 98101 (Seattle)
+      <br><br>
+      <span class="unsupported">❌ Not supported (any other zip)</span>
+      e.g. 33101 (Miami), 70112 (New Orleans), 99501 (Anchorage)
+    </div>
   </div>
-  <hr>
-  <p class="note">
-    <strong>How it works:</strong><br>
-    1. Click "Pay with PayPal" → <code>SetExpressCheckout</code> is called with <code>CALLBACK</code> set to <code>/callback</code>.<br>
-    2. On the PayPal review page, when the buyer changes their shipping address, PayPal POSTs to <code>/callback</code>.<br>
-    3. The server calculates shipping options for that address and responds with <code>CallbackResponse</code> NVP data.<br>
-    4. PayPal updates the shipping drop-down live without a page reload.<br>
-    5. After buyer confirms, they return to <code>/return</code> where <code>DoExpressCheckoutPayment</code> is called.
-  </p>
 </body>
 </html>`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 1 – Start checkout: call SetExpressCheckout, redirect to PayPal
+// STEP 1 — SetExpressCheckout → redirect to PayPal
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/checkout', async (req, res) => {
   const base = process.env.BASE_URL;
@@ -70,9 +84,7 @@ app.get('/checkout', async (req, res) => {
       cancelUrl:   `${base}/cancel`,
       callbackUrl: `${base}/callback`,
     });
-
     console.log(`[SetExpressCheckout] TOKEN=${token}`);
-    console.log(`[SetExpressCheckout] Redirecting buyer to: ${redirectUrl}`);
     res.redirect(redirectUrl);
   } catch (err) {
     console.error('[SetExpressCheckout] ERROR:', err.message);
@@ -81,39 +93,45 @@ app.get('/checkout', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 2 – Instant Update Callback (PayPal → your server)
+// STEP 2 — Instant Update Callback (PayPal → your server)
 //
-// PayPal POSTs here whenever the buyer changes their shipping address on the
-// PayPal review page.  You must respond within CALLBACKTIMEOUT seconds with
-// CallbackResponse NVP data.
+// PayPal POSTs the buyer's shipping address here when they change it.
+// We check if the pincode (SHIPTOZIP) is serviceable:
+//   → YES: respond with shipping options (PayPal shows them in dropdown)
+//   → NO:  respond with NO_SHIPPING_OPTION_DETAILS=1 (PayPal blocks that address)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/callback', (req, res) => {
-  const body = req.body; // already parsed by express.urlencoded
+  const body = req.body;
 
-  console.log('\n─── Instant Update Callback received ───');
-  console.log('TOKEN    :', body.TOKEN);
-  console.log('Address  :', {
-    street:  body.SHIPTOSTREET,
-    city:    body.SHIPTOCITY,
-    state:   body.SHIPTOSTATE,
-    zip:     body.SHIPTOZIP,
-    country: body.SHIPTOCOUNTRY,
-  });
+  const zip     = body.SHIPTOZIP     || '';
+  const state   = body.SHIPTOSTATE   || '';
+  const country = body.SHIPTOCOUNTRY || '';
+  const city    = body.SHIPTOCITY    || '';
 
-  // Calculate shipping options for this address
-  const options  = calculateShippingOptions(body);
-  const nvpReply = buildCallbackResponse(options, body.CURRENCYCODE || 'USD');
+  console.log('\n🔔 ─── Instant Update Callback ───');
+  console.log(`   Token   : ${body.TOKEN}`);
+  console.log(`   Address : ${city}, ${state} ${zip}, ${country}`);
 
-  console.log('Shipping options returned:');
-  options.forEach(o => console.log(`  ${o.name}: $${o.amount} (default=${o.isDefault})`));
+  // Calculate shipping — returns { supported, options? }
+  const result   = calculateShippingOptions(body);
+  const nvpReply = buildCallbackResponse(result, body.CURRENCYCODE || 'USD');
 
-  // Respond with NVP-encoded CallbackResponse
+  if (result.supported) {
+    console.log(`   ✅ Delivery SUPPORTED for zip: ${zip}`);
+    result.options.forEach(o =>
+      console.log(`      ${o.name}: $${o.amount} (default=${o.isDefault})`)
+    );
+  } else {
+    console.log(`   ❌ Delivery NOT SUPPORTED for zip: ${zip}`);
+    console.log(`      PayPal will block checkout for this address`);
+  }
+
   res.setHeader('Content-Type', 'application/x-www-form-urlencoded');
   res.send(nvpReply);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 3 – Return URL: buyer approved on PayPal, now capture payment
+// STEP 3 — Return URL: capture payment
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/return', async (req, res) => {
   const { token, PayerID } = req.query;
@@ -123,27 +141,24 @@ app.get('/return', async (req, res) => {
   }
 
   try {
-    // Fetch buyer details & chosen shipping option
-    const details = await getExpressCheckoutDetails(token);
-    console.log('\n─── GetExpressCheckoutDetails ───');
-    console.log('Payer    :', details.EMAIL);
-    console.log('Ship to  :', details.SHIPTONAME, details.SHIPTOSTREET, details.SHIPTOCITY);
-    console.log('Shipping :', details.PAYMENTREQUEST_0_SHIPPINGAMT);
-
+    const details     = await getExpressCheckoutDetails(token);
     const shippingAmt = details.PAYMENTREQUEST_0_SHIPPINGAMT || '5.00';
 
-    // Complete the payment
+    console.log('\n─── GetExpressCheckoutDetails ───');
+    console.log('Payer    :', details.EMAIL);
+    console.log('Zip      :', details.SHIPTOZIP);
+    console.log('Shipping :', shippingAmt);
+
     const payment = await doExpressCheckoutPayment({ token, payerId: PayerID, shippingAmt });
+
     console.log('\n─── DoExpressCheckoutPayment ───');
-    console.log('ACK         :', payment.ACK);
-    console.log('Transaction :', payment.PAYMENTINFO_0_TRANSACTIONID);
-    console.log('Status      :', payment.PAYMENTINFO_0_PAYMENTSTATUS);
+    console.log('Transaction:', payment.PAYMENTINFO_0_TRANSACTIONID);
+    console.log('Status     :', payment.PAYMENTINFO_0_PAYMENTSTATUS);
 
     res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Payment Complete</title>
+  <meta charset="UTF-8"><title>Payment Complete</title>
   <style>
     body { font-family: Arial, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; }
     .success { background: #e6f4ea; border: 1px solid #34a853; padding: 24px; border-radius: 8px; }
@@ -156,8 +171,9 @@ app.get('/return', async (req, res) => {
     <p><strong>Transaction ID:</strong> <code>${payment.PAYMENTINFO_0_TRANSACTIONID}</code></p>
     <p><strong>Status:</strong> ${payment.PAYMENTINFO_0_PAYMENTSTATUS}</p>
     <p><strong>Amount charged:</strong> $${payment.PAYMENTINFO_0_AMT} ${payment.PAYMENTINFO_0_CURRENCYCODE}</p>
-    <p><strong>Shipping used:</strong> $${shippingAmt}</p>
-    <p><strong>Buyer email:</strong> ${details.EMAIL}</p>
+    <p><strong>Delivered to zip:</strong> ${details.SHIPTOZIP}</p>
+    <p><strong>Shipping:</strong> $${shippingAmt}</p>
+    <p><strong>Buyer:</strong> ${details.EMAIL}</p>
   </div>
   <p><a href="/">← Back to shop</a></p>
 </body>
@@ -169,27 +185,18 @@ app.get('/return', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CANCEL URL – buyer clicked "Cancel" on the PayPal page
+// CANCEL
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/cancel', (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>Cancelled</title>
-<style>body{font-family:Arial,sans-serif;max-width:600px;margin:60px auto;padding:0 20px}</style>
-</head>
-<body>
-  <h1>❌ Payment Cancelled</h1>
-  <p>You cancelled the PayPal checkout.</p>
-  <p><a href="/">← Back to shop</a></p>
-</body>
-</html>`);
+  res.send(`<h1>❌ Cancelled</h1><p><a href="/">← Back</a></p>`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// START SERVER
+// START
 // ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🚀 EC Instant Update Demo running on http://localhost:${PORT}`);
-  console.log(`   Callback URL PayPal will call: ${process.env.BASE_URL || '<BASE_URL not set>'}/callback`);
-  console.log('   Make sure BASE_URL is publicly reachable (use ngrok for local dev)\n');
+  console.log(`\n🚀 Server: http://localhost:${PORT}`);
+  console.log(`   Callback: ${process.env.BASE_URL}/callback`);
+  console.log(`\n   Supported zips: 10001, 90001, 60601, 94102, 95101, 98101`);
+  console.log(`   All other zips → delivery blocked\n`);
 });
