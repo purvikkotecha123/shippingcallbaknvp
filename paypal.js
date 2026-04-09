@@ -1,9 +1,8 @@
 'use strict';
 
 const axios = require('axios');
-const qs = require('qs');
+const qs    = require('qs');
 
-// PayPal sandbox NVP endpoint
 const PAYPAL_NVP_ENDPOINT = 'https://api-3t.sandbox.paypal.com/nvp';
 const PAYPAL_CHECKOUT_URL = 'https://www.sandbox.paypal.com/checkoutnow?token=';
 
@@ -13,10 +12,10 @@ const PAYPAL_CHECKOUT_URL = 'https://www.sandbox.paypal.com/checkoutnow?token=';
  */
 async function nvpRequest(params) {
   const payload = {
-    USER: process.env.PAYPAL_API_USERNAME,
-    PWD: process.env.PAYPAL_API_PASSWORD,
+    USER:      process.env.PAYPAL_API_USERNAME,
+    PWD:       process.env.PAYPAL_API_PASSWORD,
     SIGNATURE: process.env.PAYPAL_API_SIGNATURE,
-    VERSION: '204.0',
+    VERSION:   '109.0',
     ...params,
   };
 
@@ -35,79 +34,90 @@ async function nvpRequest(params) {
 }
 
 /**
- * Step 1 – SetExpressCheckout
+ * Step 1 - SetExpressCheckout
  *
- * Registers the transaction with PayPal and returns a TOKEN.
- * The key Instant Update parameters are:
- *   CALLBACK      – URL PayPal will POST to when buyer changes shipping address
- *   CALLBACKVERSION – must be >= 61.0
- *   L_SHIPPINGOPTIONISDEFAULT0 – marks the default shipping option shown before callback fires
+ * AMT rule (strictly enforced by PayPal):
+ *   AMT = ITEMAMT + SHIPPINGAMT
+ *   ITEMAMT must equal the exact sum of (L_AMTn * L_QTYn) for all line items
+ *
+ * Example here:
+ *   1 x Widget Pro @ $20.00  => ITEMAMT = $20.00
+ *   Shipping estimate         => SHIPPINGAMT = $5.00
+ *   Grand total               => AMT = $25.00
  */
 async function setExpressCheckout({ returnUrl, cancelUrl, callbackUrl }) {
+  const ITEM_AMT     = '20.00';
+  const SHIPPING_AMT = '5.00';
+  const TOTAL_AMT    = '25.00'; // must equal ITEM_AMT + SHIPPING_AMT
+
   const params = {
     METHOD: 'SetExpressCheckout',
 
-    // ----- Core payment fields -----
-    PAYMENTREQUEST_0_AMT: '25.00',        // Subtotal (before shipping/tax)
-    PAYMENTREQUEST_0_ITEMAMT: '20.00',    // Must equal sum of line items
-    PAYMENTREQUEST_0_SHIPPINGAMT: '5.00', // Initial shipping estimate
-    PAYMENTREQUEST_0_TAXAMT: '0.00',
-    PAYMENTREQUEST_0_CURRENCYCODE: 'USD',
+    // Grand total — must equal ITEMAMT + SHIPPINGAMT
+    PAYMENTREQUEST_0_AMT:           TOTAL_AMT,
+    PAYMENTREQUEST_0_CURRENCYCODE:  'USD',
     PAYMENTREQUEST_0_PAYMENTACTION: 'Sale',
 
-    // ----- Line items -----
-    L_PAYMENTREQUEST_0_NAME0: 'Widget Pro',
+    // Breakdown — ITEMAMT + SHIPPINGAMT must equal AMT exactly
+    PAYMENTREQUEST_0_ITEMAMT:     ITEM_AMT,
+    PAYMENTREQUEST_0_SHIPPINGAMT: SHIPPING_AMT,
+
+    // Line items — (L_AMT0 * L_QTY0) must equal ITEMAMT exactly
+    // 1 x $20.00 = $20.00 ✓
+    L_PAYMENTREQUEST_0_NAME0:   'Widget Pro',
     L_PAYMENTREQUEST_0_NUMBER0: 'SKU-001',
-    L_PAYMENTREQUEST_0_DESC0: 'Premium widget with all the bells',
-    L_PAYMENTREQUEST_0_AMT0: '10.00',
-    L_PAYMENTREQUEST_0_QTY0: '2',
+    L_PAYMENTREQUEST_0_DESC0:   'Premium widget with all the bells',
+    L_PAYMENTREQUEST_0_AMT0:    '20.00',
+    L_PAYMENTREQUEST_0_QTY0:    '1',
 
-    // ----- Return / cancel URLs -----
-    RETURNURL: returnUrl,
-    CANCELURL: cancelUrl,
+    RETURNURL:  returnUrl,
+    CANCELURL:  cancelUrl,
 
-    // ----- Instant Update (Callback) fields -----
-    CALLBACK: callbackUrl,           // PayPal will POST shipping address here
-    CALLBACKVERSION: '204.0',        // Must be >= 61.0
-    CALLBACKTIMEOUT: '6',            // Seconds PayPal waits for your callback response
+    // Instant Update / Callback fields
+    CALLBACK:        callbackUrl,
+    CALLBACKVERSION: '109.0',  // must be >= 61.0
+    CALLBACKTIMEOUT: '6',
 
-    // Initial (fallback) flat-rate shipping option shown before callback fires
+    // Fallback shipping option shown before callback fires
+    L_SHIPPINGOPTIONNAME0:      'Standard',
+    L_SHIPPINGOPTIONLABEL0:     'Standard (5-7 days)',
+    L_SHIPPINGOPTIONAMOUNT0:    '5.00',
     L_SHIPPINGOPTIONISDEFAULT0: 'true',
-    L_SHIPPINGOPTIONNAME0: 'Standard',
-    L_SHIPPINGOPTIONLABEL0: 'Standard (5–7 days)',
-    L_SHIPPINGOPTIONAMOUNT0: '5.00',
   };
 
   const result = await nvpRequest(params);
   return {
-    token: result.TOKEN,
+    token:       result.TOKEN,
     redirectUrl: `${PAYPAL_CHECKOUT_URL}${result.TOKEN}`,
   };
 }
 
 /**
- * Step 3 – GetExpressCheckoutDetails
- * Called after buyer returns from PayPal to fetch their chosen info.
+ * Step 2 - GetExpressCheckoutDetails
+ * Fetch buyer info and chosen shipping after they return from PayPal.
  */
 async function getExpressCheckoutDetails(token) {
   return nvpRequest({ METHOD: 'GetExpressCheckoutDetails', TOKEN: token });
 }
 
 /**
- * Step 4 – DoExpressCheckoutPayment
- * Actually charges the buyer.
+ * Step 3 - DoExpressCheckoutPayment
+ * Capture the payment. AMT must again equal ITEMAMT + SHIPPINGAMT.
  */
 async function doExpressCheckoutPayment({ token, payerId, shippingAmt }) {
+  const shipping = parseFloat(shippingAmt || '5.00').toFixed(2);
+  const total    = (20.00 + parseFloat(shipping)).toFixed(2);
+
   return nvpRequest({
-    METHOD: 'DoExpressCheckoutPayment',
-    TOKEN: token,
-    PAYERID: payerId,
-    PAYMENTREQUEST_0_AMT: (20.00 + parseFloat(shippingAmt || '5.00')).toFixed(2),
-    PAYMENTREQUEST_0_ITEMAMT: '20.00',
-    PAYMENTREQUEST_0_SHIPPINGAMT: shippingAmt || '5.00',
-    PAYMENTREQUEST_0_TAXAMT: '0.00',
-    PAYMENTREQUEST_0_CURRENCYCODE: 'USD',
+    METHOD:   'DoExpressCheckoutPayment',
+    TOKEN:    token,
+    PAYERID:  payerId,
+
+    PAYMENTREQUEST_0_AMT:           total,
+    PAYMENTREQUEST_0_CURRENCYCODE:  'USD',
     PAYMENTREQUEST_0_PAYMENTACTION: 'Sale',
+    PAYMENTREQUEST_0_ITEMAMT:       '20.00',
+    PAYMENTREQUEST_0_SHIPPINGAMT:   shipping,
   });
 }
 
