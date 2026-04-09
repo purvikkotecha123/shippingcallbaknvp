@@ -5,24 +5,29 @@ const qs    = require('qs');
 
 const PAYPAL_NVP_ENDPOINT = 'https://api-3t.sandbox.paypal.com/nvp';
 const PAYPAL_CHECKOUT_URL = 'https://www.sandbox.paypal.com/checkoutnow?token=';
+const NVP_VERSION         = '109.0';
 
-/**
- * Send a raw NVP request to PayPal.
- * Returns a parsed key/value object from the response.
- */
+// Order amounts
+const ITEM_AMT     = '20.00';
+const SHIPPING_AMT = '5.00';
+const TOTAL_AMT    = '25.00'; // ITEM_AMT + SHIPPING_AMT
+
+// MAXAMT must be >= TOTAL_AMT + highest possible shipping option amount
+// PayPal adds all shipping option amounts to its internal max check (error 11832 if too low)
+const MAX_AMT = '100.00';
+
 async function nvpRequest(params) {
   const payload = {
     USER:      process.env.PAYPAL_API_USERNAME,
     PWD:       process.env.PAYPAL_API_PASSWORD,
     SIGNATURE: process.env.PAYPAL_API_SIGNATURE,
-    VERSION:   '109.0',
+    VERSION:   NVP_VERSION,
     ...params,
   };
 
   console.log('\n─── NVP REQUEST ───');
-  // Log everything except credentials
-  const { USER, PWD, SIGNATURE, ...safePayload } = payload;
-  console.log(JSON.stringify(safePayload, null, 2));
+  const { USER, PWD, SIGNATURE, ...safe } = payload;
+  console.log(JSON.stringify(safe, null, 2));
 
   const response = await axios.post(
     PAYPAL_NVP_ENDPOINT,
@@ -36,7 +41,6 @@ async function nvpRequest(params) {
   console.log(JSON.stringify(result, null, 2));
 
   if (result.ACK !== 'Success' && result.ACK !== 'SuccessWithWarning') {
-    // Collect ALL error messages PayPal returned
     const errors = [];
     let i = 0;
     while (result[`L_ERRORCODE${i}`]) {
@@ -51,14 +55,12 @@ async function nvpRequest(params) {
 /**
  * Step 1 - SetExpressCheckout
  *
- * AMT rules (strictly enforced):
+ * Key rules:
  *   AMT      = ITEMAMT + SHIPPINGAMT
- *   ITEMAMT  = sum of (L_AMTn * L_QTYn) for all line items
- *
- * Here: 1 x Widget Pro @ $20.00
- *   ITEMAMT     = $20.00
- *   SHIPPINGAMT = $5.00
- *   AMT         = $25.00
+ *   ITEMAMT  = sum of (L_AMTn * L_QTYn)
+ *   SHIPPINGAMT must equal L_SHIPPINGOPTIONAMOUNT0 (the default option)
+ *   MAXAMT   must be >= AMT + sum of ALL shipping option amounts
+ *            (PayPal internally adds option amounts to validate against MAXAMT)
  */
 async function setExpressCheckout({ returnUrl, cancelUrl, callbackUrl }) {
   const params = {
@@ -66,29 +68,30 @@ async function setExpressCheckout({ returnUrl, cancelUrl, callbackUrl }) {
 
     PAYMENTREQUEST_0_PAYMENTACTION: 'Sale',
     PAYMENTREQUEST_0_CURRENCYCODE:  'USD',
-    PAYMENTREQUEST_0_AMT:           '25.00',  // Grand total = ITEMAMT + SHIPPINGAMT
-    PAYMENTREQUEST_0_ITEMAMT:       '20.00',  // Must equal sum of line items below
-    PAYMENTREQUEST_0_SHIPPINGAMT:   '5.00',   // Estimate; updated live via callback
+    PAYMENTREQUEST_0_AMT:           TOTAL_AMT,   // 25.00
+    PAYMENTREQUEST_0_ITEMAMT:       ITEM_AMT,    // 20.00
+    PAYMENTREQUEST_0_SHIPPINGAMT:   SHIPPING_AMT, // 5.00 — must match default option below
+    MAXAMT:                         MAX_AMT,      // must cover AMT + all shipping options
 
-    // 1 line item: 1 x $20.00 = $20.00 == ITEMAMT ✓
+    // Line items — required when CALLBACK is set
     L_PAYMENTREQUEST_0_NAME0:   'Widget Pro',
     L_PAYMENTREQUEST_0_NUMBER0: 'SKU-001',
     L_PAYMENTREQUEST_0_DESC0:   'Premium widget',
-    L_PAYMENTREQUEST_0_AMT0:    '20.00',
+    L_PAYMENTREQUEST_0_AMT0:    ITEM_AMT,        // 20.00 x 1 = ITEMAMT ✓
     L_PAYMENTREQUEST_0_QTY0:    '1',
 
-    RETURNURL:  returnUrl,
-    CANCELURL:  cancelUrl,
+    RETURNURL: returnUrl,
+    CANCELURL: cancelUrl,
 
-    // ── Instant Update (Callback) ──
+    // Instant Update callback
     CALLBACK:        callbackUrl,
-    CALLBACKVERSION: '109.0',   // must be >= 61.0
+    CALLBACKVERSION: NVP_VERSION,
     CALLBACKTIMEOUT: '6',
 
-    // Fallback shipping option before callback fires
+    // Default shipping option — amount must equal SHIPPINGAMT above
     L_SHIPPINGOPTIONNAME0:      'Standard',
     L_SHIPPINGOPTIONLABEL0:     'Standard (5-7 days)',
-    L_SHIPPINGOPTIONAMOUNT0:    '5.00',
+    L_SHIPPINGOPTIONAMOUNT0:    SHIPPING_AMT,    // 5.00
     L_SHIPPINGOPTIONISDEFAULT0: 'true',
   };
 
@@ -108,11 +111,10 @@ async function getExpressCheckoutDetails(token) {
 
 /**
  * Step 3 - DoExpressCheckoutPayment
- * AMT must again equal ITEMAMT + SHIPPINGAMT exactly.
  */
 async function doExpressCheckoutPayment({ token, payerId, shippingAmt }) {
-  const shipping = parseFloat(shippingAmt || '5.00').toFixed(2);
-  const total    = (20.00 + parseFloat(shipping)).toFixed(2);
+  const shipping = parseFloat(shippingAmt || SHIPPING_AMT).toFixed(2);
+  const total    = (parseFloat(ITEM_AMT) + parseFloat(shipping)).toFixed(2);
 
   return nvpRequest({
     METHOD:  'DoExpressCheckoutPayment',
@@ -122,7 +124,7 @@ async function doExpressCheckoutPayment({ token, payerId, shippingAmt }) {
     PAYMENTREQUEST_0_PAYMENTACTION: 'Sale',
     PAYMENTREQUEST_0_CURRENCYCODE:  'USD',
     PAYMENTREQUEST_0_AMT:           total,
-    PAYMENTREQUEST_0_ITEMAMT:       '20.00',
+    PAYMENTREQUEST_0_ITEMAMT:       ITEM_AMT,
     PAYMENTREQUEST_0_SHIPPINGAMT:   shipping,
   });
 }
